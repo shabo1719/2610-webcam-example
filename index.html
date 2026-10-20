@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hand Drawing</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+
+  <!-- hidden webcam feed -->
+  <video id="webcam" autoplay playsinline style="display:none"></video>
+
+  <!-- persistent drawing layer -->
+  <canvas id="draw"></canvas>
+
+  <!-- landmark overlay (cleared each frame) -->
+  <canvas id="landmarks"></canvas>
+
+  <script type="module">
+    import {
+      HandLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
+
+    // ── DOM ───────────────────────────────────────────────
+    const video   = document.getElementById("webcam");
+    const drawCv  = document.getElementById("draw");
+    const lmCv    = document.getElementById("landmarks");
+    const drawCtx = drawCv.getContext("2d");
+    const lmCtx   = lmCv.getContext("2d");
+
+    // ── Size canvases to window ───────────────────────────
+    function resize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      drawCv.width  = lmCv.width  = w;
+      drawCv.height = lmCv.height = h;
+    }
+    resize();
+    window.addEventListener("resize", () => {
+      // preserve drawing on resize
+      const img = drawCtx.getImageData(0, 0, drawCv.width, drawCv.height);
+      resize();
+      drawCtx.putImageData(img, 0, 0);
+    });
+
+    // ── Hand connections ──────────────────────────────────
+    const CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16],
+      [13,17],[17,18],[18,19],[19,20],
+      [0,17]
+    ];
+
+    // ── State ─────────────────────────────────────────────
+    let handLandmarker = null;
+    let prevPoint = null;       // last fingertip position for smooth lines
+    let wasPointing = false;    // track pointing state for line continuity
+
+    // ── Gesture helpers ───────────────────────────────────
+    function isFingerExtended(lm, tip, pip) {
+      return lm[tip].y < lm[pip].y;   // tip above pip in screen coords
+    }
+
+    function isPointingUp(lm) {
+      const indexUp  = isFingerExtended(lm, 8, 6);
+      const middleDown = !isFingerExtended(lm, 12, 10);
+      const ringDown   = !isFingerExtended(lm, 16, 14);
+      const pinkyDown  = !isFingerExtended(lm, 20, 18);
+      return indexUp && middleDown && ringDown && pinkyDown;
+    }
+
+    function isFist(lm) {
+      return !isFingerExtended(lm, 8, 6)
+          && !isFingerExtended(lm, 12, 10)
+          && !isFingerExtended(lm, 16, 14)
+          && !isFingerExtended(lm, 20, 18);
+    }
+
+    // ── Init MediaPipe ────────────────────────────────────
+    async function init() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+      );
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 1
+      });
+      startCamera();
+    }
+
+    // ── Camera ────────────────────────────────────────────
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 960 } }
+      });
+      video.srcObject = stream;
+      await video.play();
+      detect();
+    }
+
+    // ── Detection loop ────────────────────────────────────
+    function detect() {
+      if (!handLandmarker || video.readyState < 2) {
+        requestAnimationFrame(detect);
+        return;
+      }
+
+      const results = handLandmarker.detectForVideo(video, performance.now());
+
+      const W = lmCv.width;
+      const H = lmCv.height;
+
+      // clear landmark layer
+      lmCtx.clearRect(0, 0, W, H);
+
+      if (results.landmarks && results.landmarks.length > 0) {
+        const lm = results.landmarks[0];
+
+        // ── Draw landmarks ────────────────────────────────
+        // connections
+        lmCtx.strokeStyle = "rgba(108, 92, 231, 0.6)";
+        lmCtx.lineWidth = 2;
+        lmCtx.lineCap = "round";
+        for (const [a, b] of CONNECTIONS) {
+          const ax = (1 - lm[a].x) * W, ay = lm[a].y * H;
+          const bx = (1 - lm[b].x) * W, by = lm[b].y * H;
+          lmCtx.beginPath();
+          lmCtx.moveTo(ax, ay);
+          lmCtx.lineTo(bx, by);
+          lmCtx.stroke();
+        }
+        // dots
+        for (const p of lm) {
+          const x = (1 - p.x) * W, y = p.y * H;
+          lmCtx.beginPath();
+          lmCtx.arc(x, y, 3, 0, Math.PI * 2);
+          lmCtx.fillStyle = "rgba(0, 206, 201, 0.8)";
+          lmCtx.fill();
+        }
+
+        // ── Gesture: Pointing Up → draw red line ─────────
+        if (isPointingUp(lm)) {
+          const tip = lm[8];
+          const cx = (1 - tip.x) * W;
+          const cy = tip.y * H;
+
+          if (wasPointing && prevPoint) {
+            drawCtx.strokeStyle = "#ff0000";
+            drawCtx.lineWidth = 20;
+            drawCtx.lineCap = "round";
+            drawCtx.lineJoin = "round";
+            drawCtx.beginPath();
+            drawCtx.moveTo(prevPoint.x, prevPoint.y);
+            drawCtx.lineTo(cx, cy);
+            drawCtx.stroke();
+          }
+
+          prevPoint = { x: cx, y: cy };
+          wasPointing = true;
+        } else {
+          wasPointing = false;
+          prevPoint = null;
+        }
+
+        // ── Gesture: Fist → clear drawing ────────────────
+        if (isFist(lm)) {
+          drawCtx.clearRect(0, 0, drawCv.width, drawCv.height);
+        }
+
+      } else {
+        // no hand detected
+        wasPointing = false;
+        prevPoint = null;
+      }
+
+      requestAnimationFrame(detect);
+    }
+
+    // ── Boot ──────────────────────────────────────────────
+    init();
+  </script>
+</body>
+</html>
